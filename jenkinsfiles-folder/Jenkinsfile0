@@ -1,0 +1,1410 @@
+
+//jenkins pipeline by 
+
+pipeline {
+  agent {   //  with in this agnet i crating whole k8 pod for jenkins agents
+    kubernetes { 
+      yaml '''
+        apiVersion: v1
+        kind: Pod
+        metadata:
+          labels:
+            app: test
+        spec:
+          containers:
+          - name: maven
+            image: maven:3.8.3-adoptopenjdk-11
+            command:
+            - cat               //    with this cat command this maven conteiner keep working on on ever
+            tty: true
+            volumeMounts:
+            - mountPath: "/root/.m2/repository"     // by this , it get data from root dir ,  then .me folder, then repository , form here it get data 
+              name: cache
+          - name: git
+            image: bitnami/git:latest
+            command:
+            - cat
+            tty: true
+          - name: docker
+            image: docker:latest
+            command:
+            - cat
+            tty: true
+            volumeMounts:
+            - mountPath: /var/run/docker.sock
+              name: docker-sock
+          - name: sonarcli
+            image: sonarsource/sonar-scanner-cli:latest
+            command:
+            - cat
+            tty: true
+          - name: kubectl-helm-cli
+            image: kunchalavikram/kubectl_helm_cli:latest
+            command:
+            - cat
+            tty: true
+          - name: curl  // for sending data by using curl we creating this curl container 
+            image: alpine/curl:latest
+            command:
+            - cat
+            tty: true
+          volumes:       // here we crate volume for this  pod  
+          - name: cache
+            persistentVolumeClaim:
+              claimName: maven-cache
+          - name: docker-sock
+            hostPath:
+              path: /var/run/docker.sock
+      '''
+    }      
+  }
+  environment{      // we can use these environment varilabes across  project  
+    NEXUS_VERSION = "nexus3"
+    NEXUS_PROTOCOL = "http"
+    NEXUS_URL = "IP:PORT"
+    NEXUS_REPOSITORY = "maven-hosted"
+    NEXUS_CREDENTIAL_ID = "CREDS-ID"
+    DOCKERHUB_USERNAME = "USERNAME"
+    APP_NAME = "spring-petclinic"
+    IMAGE_NAME = "${DOCKERHUB_USERNAME}" + "/" + "${APP_NAME}"
+    IMAGE_TAG = "${BUILD_NUMBER}"
+  }
+  stages {
+    stage('Checkout SCM') {
+      when { expression { true } }
+      steps {
+        container('git') {   # we telling here this stage is to be run on git container 
+          git url: 'https://github.com/kunchalavikram1427/spring-petclinic.git',
+          branch: 'main'
+        }
+      }
+      post {
+        success {
+          sendStatus("Git Checkout","success")
+        }
+      }
+    }
+    stage('Build SW'){
+      when { expression { true } }
+      steps {
+        container('maven'){     // we telling here this stage is to be run on maven  container 
+          sh 'mvn -Dmaven.test.failure.ignore=true clean package'
+        }
+      }
+      post {
+        success {
+          junit '**/target/surefire-reports/*.xml'  // 
+          sendStatus("SW Build","success")
+        }
+      }
+    }
+    stage('Sonar Scan'){
+      when { expression { true } }  // by uisng "when expresiion " block we can skip any stage. true = consider, false=ignore the stage
+      steps{  
+        container('sonarcli'){
+          withSonarQubeEnv(credentialsId: 'CREDS', installationName: 'SERVER_DETAILS') { 
+            sh '''/opt/sonar-scanner/bin/sonar-scanner \
+              -Dsonar.projectKey=petclinic \
+              -Dsonar.projectName=petclinic \
+              -Dsonar.projectVersion=1.0 \
+              -Dsonar.sources=src/main \
+              -Dsonar.tests=src/test \
+              -Dsonar.java.binaries=target/classes  \
+              -Dsonar.language=java \
+              -Dsonar.sourceEncoding=UTF-8 \
+              -Dsonar.java.libraries=target/classes
+            '''
+          }
+        }
+      }
+      post {
+        success {
+          sendStatus("Sonar Scan","success")
+        }
+      }
+    }
+    stage('Wait for Quality Gate'){
+      when { expression { true } }
+      steps{
+        container('sonarcli'){
+          timeout(time: 1, unit: 'HOURS') {    // wait for 1 hour 
+            waitForQualityGate abortPipeline: true
+          }
+        }
+      }
+      post {
+        success {
+          sendStatus("QG Check","success")
+        }
+      }
+    }
+    stage('Publish Maven Artifacts to Nexus'){
+      when { expression { true } }
+      steps {
+        container('jnlp'){
+          script {  // this code is in groovy or scripting format, so we use script block
+            pom = readMavenPom file: "pom.xml";   // to read data from pom.xml file automatically 
+            filesByGlob = findFiles(glob: "target/*.${pom.packaging}"); 
+            echo "${filesByGlob[0].name} ${filesByGlob[0].path} ${filesByGlob[0].directory} ${filesByGlob[0].length} ${filesByGlob[0].lastModified}"
+            artifactPath = filesByGlob[0].path;
+            artifactExists = fileExists artifactPath;
+            if(artifactExists) {
+                echo "*** File: ${artifactPath}, group: ${pom.groupId}, packaging: ${pom.packaging}, version ${pom.version}";
+                nexusArtifactUploader(
+                    nexusVersion: NEXUS_VERSION,
+                    protocol: NEXUS_PROTOCOL,
+                    nexusUrl: NEXUS_URL,
+                    groupId: pom.groupId,
+                    version: pom.version,
+                    repository: NEXUS_REPOSITORY,
+                    credentialsId: NEXUS_CREDENTIAL_ID,
+                    artifacts: [
+                        [artifactId: pom.artifactId,
+                        classifier: '',
+                        file: artifactPath,
+                        type: pom.packaging],
+
+                        [artifactId: pom.artifactId,
+                        classifier: '',
+                        file: "pom.xml",
+                        type: "pom"]
+                    ]
+                );
+
+            } else {
+                error "*** File: ${artifactPath}, could not be found";
+            }
+          }
+        }
+      }
+      post {
+        success {
+          sendStatus("Push to Nexus","success")
+        }
+      }
+    }
+    stage('Publish Maven Artifacts using CURL'){
+      when { expression { false } }
+      steps{
+        container('curl') {
+          script {
+            pom = readMavenPom file: "pom.xml";
+            withCredentials([usernamePassword(credentialsId: 'CREDS', passwordVariable: 'PASS', usernameVariable: 'USER')]) {
+              sh "curl -v -u $USER:$PASS --upload-file target/${pom.artifactId}-${pom.version}.${pom.packaging} \
+              http://NEXUS-SERVER-DETAILS/repository/REPO-NAME/org/springframework/samples/${pom.artifactId}/${pom.version}/${pom.artifactId}-${pom.version}.${pom.packaging}"
+            }
+          }
+        }
+      }
+    }
+    stage('Build Docker Image'){
+      when { expression { true } }
+      steps{
+        container('docker'){
+          sh "docker build -t $IMAGE_NAME:$IMAGE_TAG ."
+          sh "docker tag $IMAGE_NAME:$IMAGE_TAG $IMAGE_NAME:latest"
+          withCredentials([usernamePassword(credentialsId: 'CREDS', passwordVariable: 'PASS', usernameVariable: 'USER')]) {
+             sh "docker login -u $USER -p $PASS"
+             sh "docker push $IMAGE_NAME:$IMAGE_TAG"
+             sh "docker push $IMAGE_NAME:latest"
+          }
+          sh "docker rmi $IMAGE_NAME:$IMAGE_TAG"
+          sh "docker rmi $IMAGE_NAME:latest"
+        }
+      }
+      post {
+        success {
+          sendStatus("Push to Dockerhub","success")
+        }
+      }
+    }
+    stage("Deploy to Kubernetes via manifests"){
+      when { expression { false } }
+      steps{
+        container('kubectl-helm-cli'){
+          withKubeConfig(caCertificate: '', clusterName: '', contextName: '', credentialsId: 'CONFIG-FILE', namespace: '', serverUrl: '') {
+            sh "kubectl apply -f deployment.yml"
+          }
+        }
+      }
+    }
+    stage("Deploy to Kubernetes via Helm"){
+      when { expression { false } }
+      steps{
+        container('kubectl-helm-cli'){
+          withKubeConfig(caCertificate: '', clusterName: '', contextName: '', credentialsId: 'CONFIG-FILE', namespace: '', serverUrl: '') {
+            sh "helm upgrade --install petclinic petclinic-chart/"
+          }
+        }
+      }
+      post {
+        success {
+          sendStatus("Deployment","success")
+        }
+      }
+    }
+    stage("Deploy to Kubernetes via Helm from Nexus"){
+      when { expression { true } }
+      steps{
+        container('kubectl-helm-cli'){
+          withKubeConfig(caCertificate: '', clusterName: '', contextName: '', credentialsId: 'k8s', namespace: '', serverUrl: '') {
+            sh "helm repo add helm-hosted http://USER:TOKEN@NEXUS-SERVER/repository/HELM-REPO/"
+            sh "helm repo update"
+            sh "helm upgrade --install test helm-hosted/petclinic-chart"
+          }
+        }
+      }
+      post {
+        success {
+          sendStatus("Deployment","success")
+        }
+      }
+    }
+  }
+  post {
+    failure {
+      mail to: 'vikram@gmail.com',
+      from: 'jenkinsadmin@gmail.com',
+      subject: "Jenkins pipeline has failed for job ${env.JOB_NAME}",
+      body: "Check build logs at ${env.BUILD_URL}"
+    }
+    success {
+      mail to: 'vikram@gmail.com',
+      from: 'jenkinsadmin@gmail.com',
+      subject: "Jenkins pipeline for job ${env.JOB_NAME} is completed successfully",
+      body: "Check build logs at ${env.BUILD_URL}"
+    }
+  }
+}       
+
+void sendStatus(String stage, String status) {
+    container('curl') {
+        withCredentials([string(credentialsId: 'TOKEN-CREDS-NAME', variable: 'TOKEN')]) {
+            sh "curl -u USER-NAME:$TOKEN -X POST 'https://api.github.com/repos/kunchalavikram1427/spring-petclinic/statuses/$SHA_ID' -H 'Accept: application/vnd.github.v3+json' -d '{\"state\": \"$status\",\"context\": \"$stage\", \"description\": \"Jenkins\", \"target_url\": \"$JENKINS_URL/job/$JOB_NAME/$BUILD_NUMBER/console\"}' "
+        }
+    }
+}
+
+
+
+//   ================================================= by deekshit ====
+
+pipeline{
+    agent any 
+    environment{
+        VERSION = "${env.BUILD_ID}"  #this env variable isunder env and under this buildid , we can declare env varibles under pipeline
+    }
+    stages{
+        stage("sonar quality check"){
+            agent {
+                docker {
+                    image 'openjdk:11'
+                }
+            }
+            steps{
+                script{                                          #sonar-token is name that we gave at time of token generated
+                    withSonarQubeEnv(credentialsId: 'sonar-token') {   #  this can be generated by pipeline genearator 
+                            sh 'chmod +x gradlew'               #we give permisions to gradlew file         
+                            sh './gradlew sonarqube'        #this code is reviewwd by sonar and give results
+                    }
+
+                    timeout(time: 1, unit: 'HOURS') {   #timeoutsnippet generator
+                      def qg = waitForQualityGate()
+                      if (qg.status != 'OK') {
+                           error "Pipeline aborted due to quality gate failure: ${qg.status}"
+                      }
+                    }
+
+                }  
+            }
+        }
+        stage("docker build & docker push"){
+            steps{
+                script{
+                    withCredentials([string(credentialsId: 'docker_pass', variable: 'docker_password')]) {
+                             sh '''
+                                docker build -t 34.125.214.226:8083/springapp:${VERSION} .  #by this docker build image in  this nexus server under that name(springapp)
+                                                                                              # check this VERSIN UNDER ENV VARIBLES ON TOP
+                                docker login -u admin -p $docker_password 34.125.214.226:8083 
+                                docker push  34.125.214.226:8083/springapp:${VERSION}
+                                docker rmi 34.125.214.226:8083/springapp:${VERSION}  #to remove older builds
+                            '''
+                    }
+                }
+            }
+        }
+        stage('indentifying misconfigs using datree in helm charts'){
+            steps{
+                script{
+
+                    dir('kubernetes/') {  #we are telling that files are in this directory, snippet generator  you can do this
+                        withEnv(['DATREE_TOKEN=GJdx2cP2TCDyUY3EhQKgTc']) { # to set/ enable datree rules , so based on these rules , it will check our directory
+                              sh 'helm datree test myapp/'   #in this folder all files are cheked by datree for misconfigurations 
+                        }
+                    }
+                }
+            }
+        }
+        stage("pushing the helm charts to nexus"){
+            steps{
+                script{
+                    withCredentials([string(credentialsId: 'docker_pass', variable: 'docker_password')]) {
+                          dir('kubernetes/') {
+                             sh '''
+                                 helmversion=$( helm show chart myapp | grep version | cut -d: -f 2 | tr -d ' ')
+                                 tar -czvf  myapp-${helmversion}.tgz myapp/
+                                 curl -u admin:$docker_password http://34.125.214.226:8081/repository/helm-hosted/ --upload-file myapp-${helmversion}.tgz -v
+                            '''
+                          }
+                    }
+                }
+            }
+        }
+
+        stage('manual approval'){
+            steps{
+                script{
+                    timeout(10) {
+                        mail bcc: '', body: "<br>Project: ${env.JOB_NAME} <br>Build Number: ${env.BUILD_NUMBER} <br> Go to build url and approve the deployment request <br> URL de build: ${env.BUILD_URL}", cc: '', charset: 'UTF-8', from: '', mimeType: 'text/html', replyTo: '', subject: "${currentBuild.result} CI: Project name -> ${env.JOB_NAME}", to: "deekshith.snsep@gmail.com";  
+                        input(id: "Deploy Gate", message: "Deploy ${params.project_name}?", ok: 'Deploy')
+                    }
+                }
+            }
+        }
+
+        stage('Deploying application on k8s cluster') {
+            steps {
+               script{
+                   withCredentials([kubeconfigFile(credentialsId: 'kubernetes-config', variable: 'KUBECONFIG')]) {  #we are authenticating k8 cluster from jenkins file if it is connecting to k8 cluster or not, we are giving kube config path for security key insted of directly we are giving here
+                        dir('kubernetes/') {
+                          sh 'helm upgrade --install --set image.repository="34.125.214.226:8083/springapp" --set image.tag="${VERSION}" myjavaapp myapp/ ' 
+                        }   #if already versin is avilabe, then upgrade do, if not there, then it go for install 
+                           # and also to get images from nexus by k8 , we need to authenticate 
+                    }
+               }
+            }
+        }
+
+        stage('verifying app deployment'){
+            steps{
+                script{
+                     withCredentials([kubeconfigFile(credentialsId: 'kubernetes-config', variable: 'KUBECONFIG')]) {
+                         sh 'kubectl run curl --image=curlimages/curl -i --rm --restart=Never -- curl myjavaapp-myapp:8080'
+                            # to verify the application is correctly working fine or not.
+                             
+                     }
+                }
+            }
+        }
+    }
+
+    post {
+		always {
+			mail bcc: '', body: "<br>Project: ${env.JOB_NAME} <br>Build Number: ${env.BUILD_NUMBER} <br> URL de build: ${env.BUILD_URL}", cc: '', charset: 'UTF-8', from: '', mimeType: 'text/html', replyTo: '', subject: "${currentBuild.result} CI: Project name -> ${env.JOB_NAME}", to: "deekshith.snsep@gmail.com";  
+		 }
+	   }
+}
+
+
+// ========================================== mr devops =================================
+pipeline{
+    agent{
+        label "jenkins-agent"
+    }
+    tools {
+        jdk 'Java17'
+        maven 'Maven3'
+    }
+    environment {
+        APP_NAME = "complete-prodcution-e2e-pipeline"
+        RELEASE = "1.0.0"
+        DOCKER_USER = "dmancloud"
+        DOCKER_PASS = 'dockerhub'
+        IMAGE_NAME = "${DOCKER_USER}" + "/" + "${APP_NAME}"
+        IMAGE_TAG = "${RELEASE}-${BUILD_NUMBER}"
+        JENKINS_API_TOKEN = credentials("JENKINS_API_TOKEN")
+
+    }
+    stages{
+        stage("Cleanup Workspace"){
+            steps {
+                cleanWs()
+            }
+
+        }
+    
+        stage("Checkout from SCM"){
+            steps {
+                git branch: 'main', credentialsId: 'github', url: 'https://github.com/dmancloud/complete-prodcution-e2e-pipeline'
+            }
+
+        }
+
+        stage("Build Application"){
+            steps {
+                sh "mvn clean package"
+            }
+
+        }
+
+        stage("Test Application"){
+            steps {
+                sh "mvn test"
+            }
+
+        }
+        
+        stage("Sonarqube Analysis") {
+            steps {
+                script {
+                    withSonarQubeEnv(credentialsId: 'jenkins-sonarqube-token') {
+                        sh "mvn sonar:sonar"
+                    }
+                }
+            }
+
+        }
+
+        stage("Quality Gate") {
+            steps {
+                script {
+                    waitForQualityGate abortPipeline: false, credentialsId: 'jenkins-sonarqube-token'
+                }
+            }
+
+        }
+
+        stage("Build & Push Docker Image") {
+            steps {
+                script {
+                    docker.withRegistry('',DOCKER_PASS) {
+                        docker_image = docker.build "${IMAGE_NAME}"
+                    }
+
+                    docker.withRegistry('',DOCKER_PASS) {
+                        docker_image.push("${IMAGE_TAG}")
+                        docker_image.push('latest')
+                    }
+                }
+            }
+
+        }
+
+        stage("Trivy Scan") {
+            steps {
+                script {
+		   sh ('docker run -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy image dmancloud/complete-prodcution-e2e-pipeline:1.0.0-22 --no-progress --scanners vuln  --exit-code 0 --severity HIGH,CRITICAL --format table')
+                }
+            }
+
+        }
+
+        stage ('Cleanup Artifacts') {
+            steps {
+                script {
+                    sh "docker rmi ${IMAGE_NAME}:${IMAGE_TAG}"
+                    sh "docker rmi ${IMAGE_NAME}:latest"
+                }
+            }
+        }
+
+
+        stage("Trigger CD Pipeline") {
+            steps {
+                script {
+                    sh "curl -v -k --user admin:${JENKINS_API_TOKEN} -X POST -H 'cache-control: no-cache' -H 'content-type: application/x-www-form-urlencoded' --data 'IMAGE_TAG=${IMAGE_TAG}' 'https://jenkins.dev.dman.cloud/job/gitops-complete-pipeline/buildWithParameters?token=gitops-token'"
+                }
+            }
+
+        }
+
+    }
+
+    post {
+        failure {
+            emailext body: '''${SCRIPT, template="groovy-html.template"}''', 
+                    subject: "${env.JOB_NAME} - Build # ${env.BUILD_NUMBER} - Failed", 
+                    mimeType: 'text/html',to: "dmistry@yourhostdirect.com"
+            }
+         success {
+               emailext body: '''${SCRIPT, template="groovy-html.template"}''', 
+                    subject: "${env.JOB_NAME} - Build # ${env.BUILD_NUMBER} - Successful", 
+                    mimeType: 'text/html',to: "dmistry@yourhostdirect.com"
+          }      
+    }
+}
+
+# ++++++++++++++++++++++++++++++++ ++++++++++++++++++++++++++++
+pipeline {
+
+  agent {
+    kubernetes {
+      yamlFile 'kaniko-builder.yaml'
+    }
+  }
+
+  environment {
+        APP_NAME = "complete-prodcution-e2e-pipeline"
+        RELEASE = "1.0.0"
+        DOCKER_USER = "dmancloud"
+        DOCKER_PASS = 'dockerhub'
+        IMAGE_NAME = "${DOCKER_USER}" + "/" + "${APP_NAME}"
+        IMAGE_TAG = "${RELEASE}-${BUILD_NUMBER}"
+        /* JENKINS_API_TOKEN = credentials("JENKINS_API_TOKEN") */
+
+    }
+
+  stages {
+
+    stage("Cleanup Workspace") {
+      steps {
+        cleanWs()
+      }
+    }
+
+    stage("Checkout from SCM"){
+            steps {
+                git branch: 'main', credentialsId: 'github', url: 'https://github.com/dmancloud/complete-prodcution-e2e-pipeline'
+            }
+
+        }
+
+    stage('Build & Push with Kaniko') {
+      steps {
+        container(name: 'kaniko', shell: '/busybox/sh') {
+          sh '''#!/busybox/sh
+
+            /kaniko/executor --dockerfile `pwd`/Dockerfile --context `pwd` --destination=${IMAGE_NAME}:${IMAGE_TAG} --destination=${IMAGE_NAME}:latest
+          '''
+        }
+      }
+    }
+  }
+}
+# ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+pipeline{
+    agent{
+        label "jenkins-agent"
+    }
+    tools {
+        jdk 'Java17'
+        maven 'Maven3'
+    }
+    environment {
+        APP_NAME = "complete-prodcution-e2e-pipeline"
+        RELEASE = "1.0.0"
+        DOCKER_USER = "dmancloud"
+        DOCKER_PASS = 'dockerhub'
+        IMAGE_NAME = "${DOCKER_USER}" + "/" + "${APP_NAME}"
+        IMAGE_TAG = "${RELEASE}-${BUILD_NUMBER}"
+        JENKINS_API_TOKEN = credentials("JENKINS_API_TOKEN")
+
+    }
+    stages{
+        stage("Cleanup Workspace"){
+            steps {
+                cleanWs()
+            }
+
+        }
+    
+        stage("Checkout from SCM"){
+            steps {
+                git branch: 'main', credentialsId: 'github', url: 'https://github.com/dmancloud/complete-prodcution-e2e-pipeline'
+            }
+
+        }
+
+        stage("Build Application"){
+            steps {
+                sh "mvn clean package"
+            }
+
+        }
+
+        stage("Test Application"){
+            steps {
+                sh "mvn test"
+            }
+
+        }
+        
+        stage("Sonarqube Analysis") {
+            steps {
+                script {
+                    withSonarQubeEnv(credentialsId: 'jenkins-sonarqube-token') {
+                        sh "mvn sonar:sonar"
+                    }
+                }
+            }
+
+        }
+
+        stage("Quality Gate") {
+            steps {
+                script {
+                    waitForQualityGate abortPipeline: false, credentialsId: 'jenkins-sonarqube-token'
+                }
+            }
+
+        }
+
+        stage("Build & Push Docker Image") {
+            steps {
+                script {
+                    docker.withRegistry('',DOCKER_PASS) {
+                        docker_image = docker.build "${IMAGE_NAME}"
+                    }
+
+                    docker.withRegistry('',DOCKER_PASS) {
+                        docker_image.push("${IMAGE_TAG}")
+                        docker_image.push('latest')
+                    }
+                }
+            }
+
+        }
+
+        stage("Trivy Scan") {
+            steps {
+                script {
+		   sh ('docker run -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy image dmancloud/complete-prodcution-e2e-pipeline:1.0.0-22 --no-progress --scanners vuln  --exit-code 0 --severity HIGH,CRITICAL --format table')
+                }
+            }
+
+        }
+
+        stage ('Cleanup Artifacts') {
+            steps {
+                script {
+                    sh "docker rmi ${IMAGE_NAME}:${IMAGE_TAG}"
+                    sh "docker rmi ${IMAGE_NAME}:latest"
+                }
+            }
+        }
+
+
+        stage("Trigger CD Pipeline") {
+            steps {
+                script {
+                    sh "curl -v -k --user admin:${JENKINS_API_TOKEN} -X POST -H 'cache-control: no-cache' -H 'content-type: application/x-www-form-urlencoded' --data 'IMAGE_TAG=${IMAGE_TAG}' 'https://jenkins.dev.dman.cloud/job/gitops-complete-pipeline/buildWithParameters?token=gitops-token'"
+                }
+            }
+
+        }
+
+    }
+
+    post {
+        failure {
+            emailext body: '''${SCRIPT, template="groovy-html.template"}''', 
+                    subject: "${env.JOB_NAME} - Build # ${env.BUILD_NUMBER} - Failed", 
+                    mimeType: 'text/html',to: "dmistry@yourhostdirect.com"
+            }
+         success {
+               emailext body: '''${SCRIPT, template="groovy-html.template"}''', 
+                    subject: "${env.JOB_NAME} - Build # ${env.BUILD_NUMBER} - Successful", 
+                    mimeType: 'text/html',to: "dmistry@yourhostdirect.com"
+          }      
+    }
+}
+
+
+# ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+kind: Pod
+spec:
+  containers:
+  - name: kaniko
+    image: gcr.io/kaniko-project/executor:debug
+    imagePullPolicy: Always
+    command:
+    - sleep
+    args:
+    - 9999999
+    volumeMounts:
+      - name: jenkins-docker-cfg
+        mountPath: /kaniko/.docker
+  volumes:
+  - name: jenkins-docker-cfg
+    projected:
+      sources:
+      - secret:
+          name: docker-credentials
+          items:
+            - key: .dockerconfigjson
+              path: config.json
+
+
+# ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+@Library('my-shared-library') _
+
+pipeline{
+
+    agent any
+
+    parameters{
+
+        choice(name: 'action', choices: 'create\ndelete', description: 'Choose create/Destroy')
+        string(name: 'ImageName', description: "name of the docker build", defaultValue: 'javapp')
+        string(name: 'ImageTag', description: "tag of the docker build", defaultValue: 'v1')
+        string(name: 'DockerHubUser', description: "name of the Application", defaultValue: 'vikashashoke')
+    }
+
+    stages{
+         
+        stage('Git Checkout'){
+                    when { expression {  params.action == 'create' } }
+            steps{
+            gitCheckout(
+                branch: "main",
+                url: "https://github.com/vikash-kumar01/mrdevops_java_app.git"
+            )
+            }
+        }
+         stage('Unit Test maven'){
+         
+         when { expression {  params.action == 'create' } }
+
+            steps{
+               script{
+                   
+                   mvnTest()
+               }
+            }
+        }
+         stage('Integration Test maven'){
+         when { expression {  params.action == 'create' } }
+            steps{
+               script{
+                   
+                   mvnIntegrationTest()
+               }
+            }
+        }
+        stage('Static code analysis: Sonarqube'){
+         when { expression {  params.action == 'create' } }
+            steps{
+               script{
+                   
+                   def SonarQubecredentialsId = 'sonarqube-api'
+                   statiCodeAnalysis(SonarQubecredentialsId)
+               }
+            }
+        }
+        stage('Quality Gate Status Check : Sonarqube'){
+         when { expression {  params.action == 'create' } }
+            steps{
+               script{
+                   
+                   def SonarQubecredentialsId = 'sonarqube-api'
+                   QualityGateStatus(SonarQubecredentialsId)
+               }
+            }
+        }
+        stage('Maven Build : maven'){
+         when { expression {  params.action == 'create' } }
+            steps{
+               script{
+                   
+                   mvnBuild()
+               }
+            }
+        }
+        stage('Docker Image Build'){
+         when { expression {  params.action == 'create' } }
+            steps{
+               script{
+                   
+                   dockerBuild("${params.ImageName}","${params.ImageTag}","${params.DockerHubUser}")
+               }
+            }
+        }
+         stage('Docker Image Scan: trivy '){
+         when { expression {  params.action == 'create' } }
+            steps{
+               script{
+                   
+                   dockerImageScan("${params.ImageName}","${params.ImageTag}","${params.DockerHubUser}")
+               }
+            }
+        }
+        stage('Docker Image Push : DockerHub '){
+         when { expression {  params.action == 'create' } }
+            steps{
+               script{
+                   
+                   dockerImagePush("${params.ImageName}","${params.ImageTag}","${params.DockerHubUser}")
+               }
+            }
+        }   
+        stage('Docker Image Cleanup : DockerHub '){
+         when { expression {  params.action == 'create' } }
+            steps{
+               script{
+                   
+                   dockerImageCleanup("${params.ImageName}","${params.ImageTag}","${params.DockerHubUser}")
+               }
+            }
+        }      
+    }
+}
+
+
+
+# +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+    @Library('my-shared-library') _
+
+    pipeline{
+
+        agent any
+
+        parameters{
+
+            choice(name: 'action', choices: 'create\ndelete', description: 'Choose create/Destroy')
+            string(name: 'aws_account_id', description: " AWS Account ID", defaultValue: '496157679619')
+            string(name: 'Region', description: "Region of ECR", defaultValue: 'us-east-1')
+            string(name: 'ECR_REPO_NAME', description: "name of the ECR", defaultValue: 'vikashashoke')
+            string(name: 'cluster', description: "name of the EKS Cluster", defaultValue: 'demo-cluster1')
+        }
+        environment{
+
+            ACCESS_KEY = credentials('AWS_ACCESS_KEY_ID')
+            SECRET_KEY = credentials('AWS_SECRET_KEY_ID')
+        }
+
+        stages{
+            
+            stage('Git Checkout'){
+                        when { expression {  params.action == 'create' } }
+                steps{
+                gitCheckout(
+                    branch: "main",
+                    url: "https://github.com/vikash-kumar01/mrdevops_java_app.git"
+                )
+                }
+            }
+        //      stage('Unit Test maven'){
+            
+        //      when { expression {  params.action == 'create' } }
+
+        //         steps{
+        //            script{
+                    
+        //                mvnTest()
+        //            }
+        //         }
+        //     }
+        //      stage('Integration Test maven'){
+        //      when { expression {  params.action == 'create' } }
+        //         steps{
+        //            script{
+                    
+        //                mvnIntegrationTest()
+        //            }
+        //         }
+        //     }
+        //     stage('Static code analysis: Sonarqube'){
+        //      when { expression {  params.action == 'create' } }
+        //         steps{
+        //            script{
+                    
+        //                def SonarQubecredentialsId = 'sonarqube-api'
+        //                statiCodeAnalysis(SonarQubecredentialsId)
+        //            }
+        //         }
+        //     }
+        //     stage('Quality Gate Status Check : Sonarqube'){
+        //      when { expression {  params.action == 'create' } }
+        //         steps{
+        //            script{
+                    
+        //                def SonarQubecredentialsId = 'sonarqube-api'
+        //                QualityGateStatus(SonarQubecredentialsId)
+        //            }
+        //         }
+        //     }
+        //     stage('Maven Build : maven'){
+        //      when { expression {  params.action == 'create' } }
+        //         steps{
+        //            script{
+                    
+        //                mvnBuild()
+        //            }
+        //         }
+        //     }
+        //     stage('Docker Image Build : ECR'){
+        //      when { expression {  params.action == 'create' } }
+        //         steps{
+        //            script{
+                    
+        //                dockerBuild("${params.aws_account_id}","${params.Region}","${params.ECR_REPO_NAME}")
+        //            }
+        //         }
+        //     }
+        // stage('Docker Image Scan: trivy '){
+        //      when { expression {  params.action == 'create' } }
+        //         steps{
+        //            script{
+                    
+        //                dockerImageScan("${params.aws_account_id}","${params.Region}","${params.ECR_REPO_NAME}")
+        //            }
+        //         }
+        //     }
+        //     stage('Docker Image Push : ECR '){
+        //      when { expression {  params.action == 'create' } }
+        //         steps{
+        //            script{
+                    
+        //                dockerImagePush("${params.aws_account_id}","${params.Region}","${params.ECR_REPO_NAME}")
+        //            }
+        //         }
+        //     }   
+        //     stage('Docker Image Cleanup : ECR '){
+        //      when { expression {  params.action == 'create' } }
+        //         steps{
+        //            script{
+                    
+        //                dockerImageCleanup("${params.aws_account_id}","${params.Region}","${params.ECR_REPO_NAME}")
+        //            }
+        //         }
+        //     } 
+            stage('Create EKS Cluster : Terraform'){
+                when { expression {  params.action == 'create' } }
+                steps{
+                    script{
+
+                        dir('eks_module') {
+                        sh """
+                            
+                            terraform init 
+                            terraform plan -var 'access_key=$ACCESS_KEY' -var 'secret_key=$SECRET_KEY' -var 'region=${params.Region}' --var-file=./config/terraform.tfvars
+                            terraform apply -var 'access_key=$ACCESS_KEY' -var 'secret_key=$SECRET_KEY' -var 'region=${params.Region}' --var-file=./config/terraform.tfvars --auto-approve
+                        """
+                    }
+                    }
+                }
+            }
+            stage('Connect to EKS '){
+                when { expression {  params.action == 'create' } }
+            steps{
+
+                script{
+
+                    sh """
+                    aws configure set aws_access_key_id "$ACCESS_KEY"
+                    aws configure set aws_secret_access_key "$SECRET_KEY"
+                    aws configure set region "${params.Region}"
+                    aws eks --region ${params.Region} update-kubeconfig --name ${params.cluster}
+                    """
+                }
+            }
+            } 
+            stage('Deployment on EKS Cluster'){
+                when { expression {  params.action == 'create' } }
+                steps{
+                    script{
+                    
+                    def apply = false
+
+                    try{
+                        input message: 'please confirm to deploy on eks', ok: 'Ready to apply the config ?'
+                        apply = true
+                    }catch(err){
+                        apply= false
+                        currentBuild.result  = 'UNSTABLE'
+                    }
+                    if(apply){
+
+                        sh """
+                        kubectl apply -f .
+                        """
+                    }
+                    }
+                }
+            }    
+        }
+    }
+    # +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+    // ======================================================
+
+
+    
+
+
+====================== devopsshack  jenkins file ==========================
+
+
+pipeline {
+    agent any
+
+    options {
+        buildDiscarder(logRotator(artifactDaysToKeepStr: '1', artifactNumToKeepStr: '1', daysToKeepStr: '5', numToKeepStr: '50'))
+        disableConcurrentBuilds()
+    }
+
+    tools {
+        nodejs "NodeJS-version"
+        oc "OpenShift_tool_name"
+    }
+
+   environment {
+    buildScript = 'build'
+    lintScript = 'lint'
+    testScript = 'test:ci'
+    srcDir = 'src'
+    chrome = 'Chrome-stable'
+    python = 'python3.9'
+
+    sonarTool = 'Sonar-scanner'
+    sonarEnv = "sonar"
+
+    groupId = 'com.devopsshack'
+    repositoryId = 'nexus'
+    repositoryUrl = 'http://ip:8081/repository/'
+    globalSettingsId = 'global-settings'
+    mavenInstallation = 'Maven3'
+
+    dockerFileName = 'Dockerfile'
+    dockerRegistryProtocol = 'https://'
+    dockerRegistry = 'private-docker-registry'
+    dockerRegistryCredentials = 'docker-cred'
+    dockerTool = 'docker-tool-name'
+
+    openShiftUrl = 'XYZ.com'
+    openShiftCredentials = 'Dev-op-cred'
+    openShiftNamespace = 'webapps'
+
+    
+}
+        
+    stages {
+        stage('Fresh Deppendency Installation') {
+                when {
+                anyOf {
+                    branch 'master'
+                    branch 'develop'
+                    branch 'release/*'
+                    branch 'feature/*'
+                    branch 'hotfix/*'
+                    branch 'bugfix/*'
+                    
+                }
+            }
+            steps {
+                sh "yarn install --ignore-engines"
+            }
+        }
+
+        stage('Code Linting') {
+            steps {
+                when {
+                anyOf {
+                    branch 'master'
+                    branch 'develop'
+                    branch 'release/*'
+                    branch 'feature/*'
+                    branch 'hotfix/*'
+                    branch 'bugfix/*'
+                   
+                }
+            }
+            steps {
+                sh """yarn ${lintScript}"""
+            }
+        }
+           
+
+        stage('Angular tests') {
+            when {
+                anyOf {
+                    branch 'develop'
+                    branch 'release/*'
+                    branch 'feature/*'
+                    branch 'bugfix/*'
+                    
+                }
+            }
+            steps {
+                sh """yarn ${testScript}"""
+            }
+        }
+
+
+        stage('OWASP Dependency Check') {
+            when {
+                anyOf {
+                    branch 'master'
+                    branch 'develop'
+                    branch 'release/*'
+                }
+            }
+            steps{
+                dependencyCheck additionalArguments: '',odcInstallation: 'DependencyCheck-9.0.2'
+                dependencyCheckPublisher pattern: '**/dependency-check-report.xml' 
+            }
+        }
+
+
+       stage ('SonarQube code analysis') {
+            when {
+                anyOf {
+                    branch 'master'
+                    branch 'develop'
+                    branch 'release/*'
+                }
+            }
+            steps {
+                script {
+                    stagename = "${env.STAGE_NAME}"
+                    def scannerHome = tool sonarTool
+                    def props = readJSON file: 'package.json'
+                    sonarCheck = "- Check [SonarQube Analysis](https://IP-ADDRESS:9000/sonarqube/dashboard?id=${props.name}${sonarProjectKey}) for ${props.name}${sonarProjectKey}."
+                    withSonarQubeEnv(sonarEnv) {
+                        sh """
+                            ${scannerHome}/bin/sonar-scanner \
+                                -Dsonar.projectKey=${props.name}${sonarProjectKey} \
+                                -Dsonar.projectName=${props.name}${sonarProjectKey} \
+                                -Dsonar.projectVersion=${props.version} \
+                                -Dsonar.sources=${srcDir} \
+                                -Dsonar.typescript.lcov.reportPaths=coverage/lcov.info \
+                                -Dsonar.exclusions='**/*.spec.ts, **/*.model.ts, **/*mock.ts, src/environments/*, **/*.d.ts, **/*.module.ts, **/main.ts, **/*contracts-definition.ts, **/dialogs-constants-data.ts, **/magic-words.ts, **/index.ts, **/*.conf.ts, src/app/shared/test/*, **/*.constants.ts, **/karma.conf.js'
+                        """
+                    }
+                    timeout(time: 1, unit: 'HOURS') {
+                        def qg = waitForQualityGate()
+                        if (qg.status != 'OK') {
+                            error "Pipeline aborted due to quality gate failure: ${qg.status}"
+                        }
+                    }
+                }
+            }
+        }
+
+        stage ('Build Application') {
+            when {
+                anyOf {
+                    branch 'master'
+                    branch 'develop'
+                    branch 'release/*'
+                    branch 'feature/*'
+                    branch 'hotfix/*'
+                    branch 'bugfix/*'
+                    changeRequest()
+                }
+            }
+            steps {
+                sh """yarn ${buildScript}"""
+            }
+        }
+
+        stage ('Deliver application into Nexus') {
+            when {
+                anyOf {
+                    branch 'master'
+                    branch 'release-candidate'
+                    branch 'develop'
+                    branch 'release/*'
+                }
+            }
+            steps {
+                script {
+                    
+                    def props = readJSON file: 'package.json'
+                    zip dir: 'dist/', zipFile: """${props.name}.zip"""
+                    version = props.version
+                    if (!version.endsWith("-SNAPSHOT") && env.BRANCH_NAME == 'develop') {
+                        version = "${version}-SNAPSHOT"
+                        version = version.replace("-RC", "")
+                    }
+
+                    if (!version.endsWith("-RC")) {
+                        if(env.BRANCH_NAME == "release-candidate") {
+                            version = "${version}-RC"
+                            version = version.replace("-SNAPSHOT", "")
+                        } else if( env.BRANCH_NAME.startsWith('release/')) {
+                            version = "${version}-UAT"
+                            version = version.replace("-SNAPSHOT", "")
+                        }
+                    }
+
+                    if (env.BRANCH_NAME == 'master' && (version.endsWith("-RC") || version.endsWith("-SNAPSHOT"))){
+                        version = version.replace("-RC", "")
+                        version = version.replace("-SNAPSHOT", "")
+                    }
+
+                    withMaven(globalMavenSettingsConfig: globalSettingsId, maven: mavenInstallation) {
+                        sh """
+                            mvn deploy:deploy-file \
+                                -DgroupId=${groupId} \
+                                -DartifactId=${props.name} \
+                                -Dversion=${version} \
+                                -Dpackaging=zip \
+                                -Dfile=${props.name}.zip \
+                                -DrepositoryId=${repositoryId} \
+                                -Durl=${repositoryUrl}${repositoryName}
+                        """
+                    }
+                }
+            }
+        }
+
+
+        stage ('Create the Docker image') {
+            when {
+                anyOf {
+                    branch 'master'
+                    branch 'develop'
+                    branch 'release/*'
+                }
+            }
+            steps {
+                script {
+                    docker.withRegistry("""${dockerRegistryProtocol}${dockerRegistry}""", dockerRegistryCredentials) {
+                        def props = readJSON file: 'package.json'
+                        dir('dist') {
+                            def customImage = docker.build("${props.name}:${props.version}", "-f ${dockerFileName} .")
+                            customImage.push()
+                            customImage.push(dockerTag);
+                        }
+                    }
+                }
+            }
+        }
+
+        stage ('Deploy the new image') {
+            when {
+                anyOf {
+                    branch 'develop'
+                    branch 'release/*'
+                }
+            }
+            steps{
+                script {
+                    props = readJSON file: 'package.json'
+                    withCredentials([usernamePassword(credentialsId: "${openShiftCredentials}", passwordVariable: 'pass', usernameVariable: 'user')]) {
+                        sh "oc login -u ${user} -p ${pass} ${openshiftUrl} --insecure-skip-tls-verify"
+                        sh "oc project ${openShiftNamespace}"
+                        try {
+                            sh "oc import-image ${props.name} --namespace=${openShiftNamespace} --from=${dockerRegistry}/${props.name} --confirm"
+                        } catch (e) {
+                            sh """
+                                oc logs \$(oc get builds -l build=${props.name} --namespace=${openShiftNamespace} --sort-by=.metadata.creationTimestamp -o name | tail -n 1) --namespace=${openShiftNamespace}
+                                throw e
+                            """
+                        }
+                    }
+                }
+            }
+        }
+
+        stage ('Check pod status') {
+            when {
+                anyOf {
+                    branch 'develop'
+                    branch 'release/*'
+                }
+            }
+            steps{
+                script {
+                    stagename = "${env.STAGE_NAME}"
+                    props = readJSON file: 'package.json'
+                    sleep 60
+                    withCredentials([usernamePassword(credentialsId: "${openShiftCredentials}", passwordVariable: 'pass', usernameVariable: 'user')]) {
+                        sh "oc login -u ${user} -p ${pass} ${openshiftUrl} --insecure-skip-tls-verify"
+                        sh "oc project ${openShiftNamespace}"
+                        sh "oc get pos"
+                        sh "oc get svc"
+
+    post {
+    success {
+        // Send email notification with green banner for success
+        emailext (
+            subject: "Build Successful: ${currentBuild.fullDisplayName}",
+            body: """<h2 style='color:green;'>Build Successful</h2><p>Details: ${BUILD_URL}</p>""",
+            recipientProviders: [[$class: 'DevelopersRecipientProvider']],
+            attachLog: true
+        )
+    }
+    failure {
+        // Send email notification with red banner for failure
+        emailext (
+            subject: "Build Failed: ${currentBuild.fullDisplayName}",
+            body: """<h2 style='color:red;'>Build Failed</h2><p>Details: ${BUILD_URL}</p>""",
+            recipientProviders: [[$class: 'DevelopersRecipientProvider']],
+            attachLog: true
+        )
+    }
+    always {
+        // Clean up workspace
+        cleanWs()
+    }
+}
+```
+
+## Explanation
+
+1. `pipeline {`: This defines the start of a Jenkins pipeline block.
+
+2. `agent any`: This specifies that the pipeline can run on any available agent (slave node).
+
+3. `options {`: This starts the options block where you can define various pipeline options.
+
+4. `buildDiscarder(logRotator(artifactDaysToKeepStr: '1', artifactNumToKeepStr: '1', daysToKeepStr: '5', numToKeepStr: '50'))`: This specifies the build discarder strategy using LogRotator, which rotates the logs based on the specified criteria.
+
+5. `disableConcurrentBuilds()`: This option disables concurrent builds to ensure that only one instance of the pipeline can run at a time.
+
+6. `tools {`: This section allows you to define tools used in the pipeline, such as Node.js and OpenShift.
+
+7. `nodejs "NodeJS-version"`: This specifies the Node.js tool to use in the pipeline with a specific version.
+
+8. `oc "OpenShift_tool_name"`: This specifies the OpenShift tool to use in the pipeline with a specific name.
+
+9. `environment {`: This section allows you to define environment variables used throughout the pipeline.
+
+10. `buildScript = 'build'`: Defines a variable `buildScript` with the value `'build'`.
+
+11. `lintScript = 'lint'`: Defines a variable `lintScript` with the value `'lint'`.
+
+12. `testScript = 'test:ci'`: Defines a variable `testScript` with the value `'test:ci'`.
+
+13. `srcDir = 'src'`: Defines a variable `srcDir` with the value `'src'`.
+
+14. `chrome = 'Chrome-stable'`: Defines a variable `chrome` with the value `'Chrome-stable'`.
+
+15. `python = 'python3.9'`: Defines a variable `python` with the value `'python3.9'`.
+
+16. `sonarTool = 'Sonar-scanner'`: Defines a variable `sonarTool` with the value `'Sonar-scanner'`.
+
+17. `sonarEnv = "sonar"`: Defines a variable `sonarEnv` with the value `'sonar'`.
+
+18. `groupId = 'com.devopsshack'`: Defines a variable `groupId` with the value `'com.devopsshack'`.
+
+19. `repositoryId = 'nexus'`: Defines a variable `repositoryId` with the value `'nexus'`.
+
+20. `repositoryUrl = 'http://ip:8081/repository/'`: Defines a variable `repositoryUrl` with the value `'http://ip:8081/repository/'`.
+
+21. `globalSettingsId = 'global-settings'`: Defines a variable `globalSettingsId` with the value `'global-settings'`.
+
+22. `mavenInstallation = 'Maven3'`: Defines a variable `mavenInstallation` with the value `'Maven3'`.
+
+23. `dockerFileName = 'Dockerfile'`: Defines a variable `dockerFileName` with the value `'Dockerfile'`.
+
+24. `dockerRegistryProtocol = 'https://'`: Defines a variable `dockerRegistryProtocol` with the value `'https://'`.
+
+25. `dockerRegistry = 'private-docker-registry'`: Defines a variable `dockerRegistry` with the value `'private-docker-registry'`.
+
+26. `dockerRegistryCredentials = 'docker-cred'`: Defines a variable `dockerRegistryCredentials` with the value `'docker-cred'`.
+
+27. `dockerTool = 'docker-tool-name'`: Defines a variable `dockerTool` with the value `'docker-tool-name'`.
+
+28. `openShiftUrl = 'XYZ.com'`: Defines a variable `openShiftUrl` with the value `'XYZ.com'`.
+
+29. `openShiftCredentials = 'Dev-op-cred'`: Defines a variable `openShiftCredentials` with the value `'Dev-op-cred'`.
+
+30. `openShiftNamespace = 'webapps'`: Defines a variable `openShiftNamespace` with the value `'webapps'`.
+
